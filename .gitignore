@@ -1,0 +1,24 @@
+# Kernel modülü derleme çıktıları
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.tmp_versions/
+.cache.mk
+Module.markers
+modules.order
+Module.symvers
+*.cmd
+.*.cmd
+
+# Derlenmiş test / userspace binary'leri
+driver/test_day1
+server/monitor_server
+client/monitor_cli
+
+# Editör / OS dosyaları
+*~
+.vscode/

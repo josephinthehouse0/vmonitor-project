@@ -56,10 +56,16 @@
  * else = a pointer to a struct client. */
 #define TAG_DEVICE ((void *)1)
 
+#define TX_BUFFER_SIZE     (64 * 1024)  /* per-client outbound buffer cap */
+
 struct client {
     int fd;
     char rx_buf[RX_BUFFER_SIZE];
     size_t rx_len;
+    char tx_buf[TX_BUFFER_SIZE];
+    size_t tx_len;          /* bytes queued, not yet sent */
+    int tx_epollout_armed;  /* whether we've told epoll to watch for writability */
+    int pending_disconnect; /* set when this client must be dropped (slow/error) */
     int watching;          /* WATCH 1 was requested */
     struct client *next;   /* intrusive singly linked list, for broadcast */
 };
@@ -67,6 +73,7 @@ struct client {
 static volatile sig_atomic_t g_stop = 0;
 static struct client *g_clients_head = NULL;
 static int g_dev_fd = -1;
+static int g_epfd = -1;
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -105,9 +112,68 @@ static void client_remove(struct client *target)
     }
 }
 
-/* Send a formatted line to one client. Stage 2 keeps this a single
- * best-effort send(); a 64 KiB tx buffer + slow-client policy for
- * partial/failed sends is explicitly a later task. */
+/* Tells epoll whether we currently care about EPOLLOUT (writability) for
+ * this client. Only armed while tx_buf has pending bytes -- otherwise
+ * epoll would keep firing "the socket is writable" forever for no
+ * reason, wasting CPU. */
+static void update_epollout_interest(struct client *c)
+{
+    int want_out = (c->tx_len > 0);
+    if (want_out == c->tx_epollout_armed)
+        return; /* no change needed */
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN | (want_out ? EPOLLOUT : 0);
+    ev.data.ptr = c;
+    if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &ev) == 0)
+        c->tx_epollout_armed = want_out;
+}
+
+/* Appends data to a client's tx_buf. If it would overflow the 64 KiB cap,
+ * this client is too slow to keep up with what we're sending it -- mark
+ * it for disconnection (the "drop the slow client" policy) instead of
+ * growing memory unboundedly. */
+static void tx_buffer_append(struct client *c, const char *data, size_t len)
+{
+    if (c->tx_len + len > TX_BUFFER_SIZE) {
+        fprintf(stderr, "[client fd=%d] tx buffer would overflow (slow client), disconnecting\n",
+                c->fd);
+        c->pending_disconnect = 1;
+        return;
+    }
+    memcpy(c->tx_buf + c->tx_len, data, len);
+    c->tx_len += len;
+    update_epollout_interest(c);
+}
+
+/* Attempts to send everything currently queued in c->tx_buf. Called both
+ * right after queuing new data (to try to flush immediately) and when
+ * epoll reports EPOLLOUT (socket became writable again after EAGAIN). */
+static void tx_buffer_flush(struct client *c)
+{
+    while (c->tx_len > 0) {
+        ssize_t sent = send(c->fd, c->tx_buf, c->tx_len, MSG_NOSIGNAL);
+        if (sent > 0) {
+            memmove(c->tx_buf, c->tx_buf + sent, c->tx_len - sent);
+            c->tx_len -= (size_t)sent;
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break; /* socket full for now, wait for the next EPOLLOUT */
+        } else {
+            if (sent < 0)
+                perror("send (flush)");
+            c->pending_disconnect = 1;
+            return;
+        }
+    }
+    update_epollout_interest(c);
+}
+
+/* Send a formatted line to one client. If the socket can take it
+ * immediately, it goes out right away with no copy. Otherwise (partial
+ * send / EAGAIN) the remainder is queued in tx_buf and retried when
+ * epoll reports EPOLLOUT. If tx_buf would overflow (client not draining
+ * fast enough), the client is marked for disconnection. */
 static void client_send(struct client *c, const char *fmt, ...)
 {
     char buf[MAX_LINE_LEN + 64];
@@ -117,21 +183,52 @@ static void client_send(struct client *c, const char *fmt, ...)
     va_end(ap);
     if (n < 0)
         return;
+
+    /* If there's already backlog queued, preserve ordering: append behind
+     * it rather than trying to send this message ahead of older ones. */
+    if (c->tx_len > 0) {
+        tx_buffer_append(c, buf, (size_t)n);
+        return;
+    }
+
     ssize_t sent = send(c->fd, buf, (size_t)n, MSG_NOSIGNAL);
-    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+    if (sent == n) {
+        return; /* common case: it all went out immediately */
+    } else if (sent >= 0) {
+        /* Partial send: queue the unsent remainder. */
+        tx_buffer_append(c, buf + sent, (size_t)(n - sent));
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        /* Socket buffer is full: queue the whole message. */
+        tx_buffer_append(c, buf, (size_t)n);
+    } else {
         perror("send");
+        c->pending_disconnect = 1;
+    }
 }
 
-/* Broadcast one EVT SAMPLE line to every client currently watching. */
+/* Broadcast one EVT SAMPLE line to every client currently watching.
+ * Saves 'next' before each iteration step because client_send() may
+ * mark (and we may then immediately remove) the current client -- e.g.
+ * a slow WATCH-ing client whose tx_buf just overflowed. */
 static void broadcast_sample(const struct vmonitor_sample *s)
 {
-    for (struct client *c = g_clients_head; c; c = c->next) {
+    struct client *c = g_clients_head;
+    while (c) {
+        struct client *next = c->next;
+
         if (c->watching) {
             client_send(c, "EVT SAMPLE %llu %llu %d %u\n",
                         (unsigned long long)s->seq,
                         (unsigned long long)s->timestamp_ns,
                         s->value_mC, s->alarm);
+            if (c->pending_disconnect) {
+                printf("[client fd=%d] disconnected (slow client / send error)\n", c->fd);
+                epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                client_remove(c);
+            }
         }
+
+        c = next;
     }
 }
 
@@ -375,6 +472,12 @@ int main(int argc, char *argv[])
     struct sockaddr_in server_addr;
     struct epoll_event ev, events[MAX_EVENTS];
 
+    /* When stdout is redirected to a file (not a TTY), glibc switches to
+     * fully-buffered mode by default, so printf() output can sit in a
+     * buffer for a long time before actually reaching the file. Force
+     * line buffering so log messages show up promptly either way. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     signal(SIGINT, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
@@ -411,6 +514,7 @@ int main(int argc, char *argv[])
 
     epfd = epoll_create1(0);
     if (epfd < 0) { perror("epoll_create1"); close(listen_fd); return 1; }
+    g_epfd = epfd;
 
     ev.events = EPOLLIN;
     ev.data.ptr = NULL; /* listening socket */
@@ -481,6 +585,18 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            if (events[i].events & EPOLLOUT) {
+                /* Socket became writable again -- try to drain any
+                 * backlog queued from a previous partial/EAGAIN send. */
+                tx_buffer_flush(c);
+                if (c->pending_disconnect) {
+                    printf("[client fd=%d] disconnected (slow client / send error)\n", c->fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                    client_remove(c);
+                    continue;
+                }
+            }
+
             if (events[i].events & EPOLLIN) {
                 int disconnected = 0;
                 for (;;) {
@@ -506,6 +622,8 @@ int main(int argc, char *argv[])
                 if (!disconnected) {
                     if (process_rx_buffer(c) < 0)
                         disconnected = 1;
+                    else if (c->pending_disconnect)
+                        disconnected = 1; /* client_send() during command handling overflowed tx_buf */
                 }
 
                 if (disconnected) {

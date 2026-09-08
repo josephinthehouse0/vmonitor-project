@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
@@ -37,6 +38,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/timerfd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -51,10 +53,16 @@
 #define SYSFS_PERIOD_MS    "/sys/class/vmonitor/vmonitor/period_ms"
 #define SYSFS_THRESHOLD_MC "/sys/class/vmonitor/vmonitor/threshold_mC"
 
+#define UDP_TELEMETRY_IP    "127.0.0.1"
+#define UDP_TELEMETRY_PORT  5001
+#define UDP_TELEMETRY_SEC   1  /* how often to send a STAT packet */
+
 /* Sentinel values distinguishing which fd an epoll event belongs to.
- * NULL = the listening socket, TAG_DEVICE = /dev/vmonitor, anything
- * else = a pointer to a struct client. */
+ * NULL = the listening socket, TAG_DEVICE = /dev/vmonitor,
+ * TAG_TIMER = the 1-second UDP telemetry timerfd, anything else =
+ * a pointer to a struct client. */
 #define TAG_DEVICE ((void *)1)
+#define TAG_TIMER  ((void *)2)
 
 #define TX_BUFFER_SIZE     (64 * 1024)  /* per-client outbound buffer cap */
 
@@ -74,6 +82,9 @@ static volatile sig_atomic_t g_stop = 0;
 static struct client *g_clients_head = NULL;
 static int g_dev_fd = -1;
 static int g_epfd = -1;
+static int g_udp_fd = -1;
+static struct sockaddr_in g_udp_dest;
+static unsigned long long g_udp_seq = 0;
 
 static void handle_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -230,6 +241,40 @@ static void broadcast_sample(const struct vmonitor_sample *s)
 
         c = next;
     }
+}
+
+/* ---- UDP telemetry ---- */
+
+/* Sends one UDP telemetry packet:
+ *   STAT <udp_seq> <last_seq> <last_value_mC> <last_alarm> <dropped_total> <running>
+ * This is connectionless -- it goes out whether or not anyone is
+ * listening on 127.0.0.1:5001, once per second, independent of any TCP
+ * client activity. */
+static void send_udp_telemetry(void)
+{
+    struct vmonitor_status st;
+    if (ioctl(g_dev_fd, VMONITOR_IOC_GET_STATUS, &st) < 0) {
+        perror("ioctl(GET_STATUS) for UDP telemetry");
+        return;
+    }
+
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "STAT %llu %llu %d %u %llu %u\n",
+                      g_udp_seq,
+                      (unsigned long long)st.last_seq,
+                      st.last_value_mC,
+                      st.last_alarm,
+                      (unsigned long long)st.dropped_total,
+                      st.running);
+    if (n < 0)
+        return;
+
+    ssize_t sent = sendto(g_udp_fd, buf, (size_t)n, 0,
+                           (struct sockaddr *)&g_udp_dest, sizeof(g_udp_dest));
+    if (sent < 0)
+        perror("sendto (UDP telemetry)");
+
+    g_udp_seq++;
 }
 
 /* ---- Talking to the driver ---- */
@@ -528,8 +573,53 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* --- UDP telemetry: socket (send-only, no bind needed) --- */
+    g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp_fd < 0) {
+        perror("socket(UDP)");
+        close(listen_fd); close(g_dev_fd); close(epfd);
+        return 1;
+    }
+    memset(&g_udp_dest, 0, sizeof(g_udp_dest));
+    g_udp_dest.sin_family = AF_INET;
+    g_udp_dest.sin_port = htons(UDP_TELEMETRY_PORT);
+    if (inet_pton(AF_INET, UDP_TELEMETRY_IP, &g_udp_dest.sin_addr) != 1) {
+        fprintf(stderr, "inet_pton failed for %s\n", UDP_TELEMETRY_IP);
+        close(listen_fd); close(g_dev_fd); close(epfd); close(g_udp_fd);
+        return 1;
+    }
+
+    /* --- 1-second ticker via timerfd, so "once per second" fits into
+     * the same single epoll loop with no thread/fork. --- */
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (timer_fd < 0) {
+        perror("timerfd_create");
+        close(listen_fd); close(g_dev_fd); close(epfd); close(g_udp_fd);
+        return 1;
+    }
+    struct itimerspec its;
+    its.it_interval.tv_sec = UDP_TELEMETRY_SEC;
+    its.it_interval.tv_nsec = 0;
+    its.it_value.tv_sec = UDP_TELEMETRY_SEC;
+    its.it_value.tv_nsec = 0;
+    if (timerfd_settime(timer_fd, 0, &its, NULL) < 0) {
+        perror("timerfd_settime");
+        close(listen_fd); close(g_dev_fd); close(epfd); close(g_udp_fd); close(timer_fd);
+        return 1;
+    }
+
+    ev.events = EPOLLIN;
+    ev.data.ptr = TAG_TIMER;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev) < 0) {
+        perror("epoll_ctl(timer_fd)");
+        close(listen_fd); close(g_dev_fd); close(epfd); close(g_udp_fd); close(timer_fd);
+        return 1;
+    }
+
     printf("monitor_server (stage 2) listening on port %d, /dev/vmonitor open (fd=%d)\n",
            port, g_dev_fd);
+    printf("UDP telemetry: STAT packets sent to %s:%d every %d second(s)\n",
+           UDP_TELEMETRY_IP, UDP_TELEMETRY_PORT, UDP_TELEMETRY_SEC);
     printf("Test with: nc 127.0.0.1 %d\n", port);
 
     while (!g_stop) {
@@ -572,6 +662,18 @@ int main(int argc, char *argv[])
             if (events[i].data.ptr == TAG_DEVICE) {
                 /* /dev/vmonitor has new samples queued -> drain + broadcast */
                 drain_device_samples();
+                continue;
+            }
+
+            if (events[i].data.ptr == TAG_TIMER) {
+                /* 1-second tick: must read the 8-byte expiration counter
+                 * to clear it, otherwise this is level-triggered and
+                 * epoll_wait() would keep firing on it immediately. */
+                uint64_t expirations;
+                ssize_t r = read(timer_fd, &expirations, sizeof(expirations));
+                if (r < 0 && errno != EAGAIN)
+                    perror("read(timer_fd)");
+                send_udp_telemetry();
                 continue;
             }
 
@@ -638,5 +740,7 @@ int main(int argc, char *argv[])
     close(listen_fd);
     close(g_dev_fd);
     close(epfd);
+    close(g_udp_fd);
+    close(timer_fd);
     return 0;
 }

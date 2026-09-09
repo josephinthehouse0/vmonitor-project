@@ -39,11 +39,11 @@ MODULE_AUTHOR("staj");
 MODULE_DESCRIPTION("Virtual temperature monitor character device - Day 2");
 
 /* Sahte sicaklik uretim orüntüsü (m°C).
- * Spesifikasyon: 10500 -> 21000 -> ... -> 40000, sonra tekrar 20000'den
- * baslayip 40000'e kadar cikar, tekrar 20000'e doner (dongu). */
+ * 20000'den 40000'e 1000'er artarak cikar, sonra basa (20000'e) doner. */
 static const s32 temp_pattern[] = {
-    10500, 21000, 31500, 40000,
-    20000, 27500, 35000, 40000,
+    20000, 21000, 22000, 23000, 24000, 25000, 26000,
+    27000, 28000, 29000, 30000, 31000, 32000, 33000,
+    34000, 35000, 36000, 37000, 38000, 39000, 40000,
 };
 #define TEMP_PATTERN_LEN ARRAY_SIZE(temp_pattern)
 
